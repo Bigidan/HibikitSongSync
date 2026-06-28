@@ -1,0 +1,8 @@
+[package]
+name = "hibikit_songsync_by_bigidun"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+symphonia = { version = "0.5.3", features = ["all"] }
+whisper-rs = "0.13.0"
