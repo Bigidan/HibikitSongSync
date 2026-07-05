@@ -1,4 +1,3 @@
-
 pub fn align_text_to_segments(
     text_lines: &[&str],
     segments: &[(i64, i64, String)],
@@ -97,7 +96,6 @@ pub fn char_similarity(a: &str, b: &str) -> f64 {
         return 0.0;
     }
 
-    // Йобані біграми
     let bigrams_a: std::collections::HashSet<(char, char)> = a
         .chars()
         .collect::<Vec<_>>()
@@ -112,43 +110,112 @@ pub fn char_similarity(a: &str, b: &str) -> f64 {
         .map(|w| (w[0], w[1]))
         .collect();
 
-    // Jaccard similarity
     let intersection = bigrams_a.intersection(&bigrams_b).count();
     let union = bigrams_a.union(&bigrams_b).count();
 
     if union == 0 { 0.0 } else { intersection as f64 / union as f64 }
 }
 
+/// Будує SRT, ГАРАНТОВАНО включаючи кожен рядок тексту рівно один раз.
+/// Для рядків, яким не дісталося жодного сегмента (помилка вирівнювання),
+/// час підбирається інтерполяцією між сусідніми відомими сегментами,
+/// або продовженням від останнього відомого сегмента, якщо це "хвіст" в кінці.
 pub fn build_srt(
     text_lines: &[&str],
     segments: &[(i64, i64, String)],
     mapping: &[usize],
 ) -> String {
-    let mut out = String::new();
-    let mut srt_index = 1;
-    let mut i = 0;
+    let m = text_lines.len();
 
-    // Групування сегментів блоками
-    while i < segments.len() {
-        let line_idx = mapping[i];
-        let t0 = segments[i].0;
-        
+    // Для кожного рядка тексту рахуємо мін(t0) і макс(t1) серед сегментів,
+    // які на нього вказали.
+    let mut line_times: Vec<Option<(i64, i64)>> = vec![None; m];
+    for (i, &line_idx) in mapping.iter().enumerate() {
+        let (t0, t1) = (segments[i].0, segments[i].1);
+        line_times[line_idx] = match line_times[line_idx] {
+            Some((cur_t0, cur_t1)) => Some((cur_t0.min(t0), cur_t1.max(t1))),
+            None => Some((t0, t1)),
+        };
+    }
+
+    const DEFAULT_DUR: i64 = 2500; // мс — орієнтовна тривалість для рядків без збігу
+
+    // Заповнюємо "діри" — рядки без жодного сегмента.
+    let mut i = 0;
+    while i < m {
+        if line_times[i].is_some() {
+            i += 1;
+            continue;
+        }
+
+        // Межі порожнього блоку [i..j)
         let mut j = i;
-        while j + 1 < segments.len() && mapping[j + 1] == line_idx {
+        while j < m && line_times[j].is_none() {
             j += 1;
         }
-        let t1 = segments[j].1;
+        let count = j - i;
 
+        let prev_end = if i > 0 { line_times[i - 1].map(|(_, t1)| t1) } else { None };
+        let next_start = if j < m { line_times[j].map(|(t0, _)| t0) } else { None };
+
+        match (prev_end, next_start) {
+            (Some(p), Some(q)) if q > p => {
+                // Є і попередній, і наступний відомий рядок — рівномірно ділимо проміжок
+                let span = q - p;
+                let step = (span / (count as i64 + 1)).max(1);
+                for k in 0..count {
+                    let t0 = p + step * (k as i64 + 1);
+                    let t1 = (t0 + step).min(q);
+                    line_times[i + k] = Some((t0, t1));
+                }
+            }
+            (Some(p), _) => {
+                // "Хвіст" в кінці (або наступний час некоректний) — продовжуємо
+                // послідовно від останнього відомого сегмента.
+                let mut cursor = p;
+                for k in 0..count {
+                    let t0 = cursor;
+                    let t1 = t0 + DEFAULT_DUR;
+                    line_times[i + k] = Some((t0, t1));
+                    cursor = t1;
+                }
+            }
+            (None, Some(q)) => {
+                // Порожньо на самому початку — рахуємо назад від першого відомого
+                let mut cursor = q;
+                for k in (0..count).rev() {
+                    let t1 = cursor;
+                    let t0 = (t1 - DEFAULT_DUR).max(0);
+                    line_times[i + k] = Some((t0, t1));
+                    cursor = t0;
+                }
+            }
+            (None, None) => {
+                // Взагалі немає жодного сегмента (напр. Whisper нічого не розпізнав)
+                let mut cursor: i64 = 0;
+                for k in 0..count {
+                    let t0 = cursor;
+                    let t1 = t0 + DEFAULT_DUR;
+                    line_times[i + k] = Some((t0, t1));
+                    cursor = t1;
+                }
+            }
+        }
+
+        i = j;
+    }
+
+    // Будуємо фінальний SRT — один запис на кожен рядок тексту, без винятків.
+    let mut out = String::new();
+    for (idx, line) in text_lines.iter().enumerate() {
+        let (t0, t1) = line_times[idx].unwrap_or((0, DEFAULT_DUR));
         out.push_str(&format!(
             "{}\n{} --> {}\n{}\n\n",
-            srt_index,
+            idx + 1,
             format_srt_time(t0),
             format_srt_time(t1),
-            text_lines[line_idx]
+            line
         ));
-
-        srt_index += 1;
-        i = j + 1;
     }
 
     out
